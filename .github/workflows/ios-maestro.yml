@@ -30,6 +30,10 @@ on:
         description: Comma-separated appearances to run, light and/or dark
         type: string
         default: light,dark
+      record:
+        description: Record each pass to MP4 (bundles grow by roughly 200 MB per 10 minutes of pass)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -137,6 +141,7 @@ jobs:
           DEVICES: ${{ inputs.devices }}
           FLOWS: ${{ inputs.flows }}
           APPEARANCES: ${{ inputs.appearances }}
+          RECORD: ${{ inputs.record }}
         run: |
           set -euo pipefail
           PRODUCTS="$RUNNER_TEMP/dd/Build/Products/Debug-iphonesimulator"
@@ -162,9 +167,12 @@ jobs:
               xcrun simctl ui "$UDID" appearance "$APPEARANCE"
               OUT="$DIAG/screenshots/$SLUG/$APPEARANCE"
               mkdir -p "$OUT" "$DIAG/maestro/$SLUG-$APPEARANCE"
-              xcrun simctl io "$UDID" recordVideo --codec h264 --force "$DIAG/video/$SLUG-$APPEARANCE.mp4" >>"$DIAG/record-$SLUG.log" 2>&1 &
-              REC=$!
-              sleep 2
+              REC=""
+              if [[ "$RECORD" == "true" ]]; then
+                xcrun simctl io "$UDID" recordVideo --codec h264 --force "$DIAG/video/$SLUG-$APPEARANCE.mp4" >>"$DIAG/record-$SLUG.log" 2>&1 &
+                REC=$!
+                sleep 2
+              fi
               rc=1
               for attempt in 1 2; do
                 (cd "$OUT" && maestro --device "$UDID" test "$SRC/$FLOWS" \
@@ -176,8 +184,10 @@ jobs:
                 tail -c 4000 "$DIAG/maestro-$SLUG-$APPEARANCE.log" | grep -q "IOSDriverTimeoutException" || break
                 echo "$SLUG $APPEARANCE attempt $attempt driver-timeout" >> "$DIAG/results.txt"
               done
-              kill -INT "$REC" 2>/dev/null || true
-              wait "$REC" 2>/dev/null || true
+              if [[ -n "$REC" ]]; then
+                kill -INT "$REC" 2>/dev/null || true
+                wait "$REC" 2>/dev/null || true
+              fi
               echo "$SLUG $APPEARANCE rc=$rc" >> "$DIAG/results.txt"
               [[ $rc -eq 0 ]] || failed=1
             done
@@ -231,7 +241,7 @@ jobs:
           name: encrypted-ios-diagnostics-${{ github.run_id }}
           path: ${{ runner.temp }}/diagnostics.tar.zst.age
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
       - name: Scrub runner
         if: always()
