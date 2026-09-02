@@ -41,6 +41,7 @@ env:
   PROJECT: TenAfter.xcodeproj
   SCHEME: TenAfter
   MAESTRO_CLI_NO_ANALYTICS: "1"
+  MAESTRO_DRIVER_STARTUP_TIMEOUT: "240000"
   HOMEBREW_NO_ANALYTICS: "1"
   HOMEBREW_NO_AUTO_UPDATE: "1"
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -159,11 +160,17 @@ jobs:
               REC=$!
               sleep 2
               set +e
-              (cd "$OUT" && maestro --device "$UDID" test "$SRC/$FLOWS" \
-                --format junit --output "$DIAG/maestro/$SLUG-$APPEARANCE.xml" \
-                --debug-output "$DIAG/maestro/$SLUG-$APPEARANCE" \
-                >>"$DIAG/maestro.log" 2>&1)
-              rc=$?
+              rc=1
+              for attempt in 1 2; do
+                (cd "$OUT" && maestro --device "$UDID" test "$SRC/$FLOWS" \
+                  --format junit --output "$DIAG/maestro/$SLUG-$APPEARANCE.xml" \
+                  --debug-output "$DIAG/maestro/$SLUG-$APPEARANCE" \
+                  >>"$DIAG/maestro.log" 2>&1)
+                rc=$?
+                [[ $rc -eq 0 ]] && break
+                tail -c 4000 "$DIAG/maestro.log" | grep -q "IOSDriverTimeoutException" || break
+                echo "$SLUG $APPEARANCE attempt $attempt driver-timeout" >> "$DIAG/results.txt"
+              done
               set -e
               kill -INT "$REC" 2>/dev/null || true
               wait "$REC" 2>/dev/null || true
