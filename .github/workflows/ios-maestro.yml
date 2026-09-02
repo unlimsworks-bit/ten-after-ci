@@ -23,9 +23,13 @@ on:
         type: string
         default: iPhone SE (3rd generation),iPhone 16 Pro Max
       flows:
-        description: Path to Maestro flows inside the payload
+        description: Path to Maestro flows inside the payload (one directory, not recursive)
         type: string
-        default: .maestro
+        default: .maestro/shots
+      appearances:
+        description: Comma-separated appearances to run, light and/or dark
+        type: string
+        default: light,dark
 
 permissions:
   contents: read
@@ -49,7 +53,7 @@ env:
 jobs:
   test:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 300
     steps:
       - name: Check configuration
         env:
@@ -132,6 +136,7 @@ jobs:
         env:
           DEVICES: ${{ inputs.devices }}
           FLOWS: ${{ inputs.flows }}
+          APPEARANCES: ${{ inputs.appearances }}
         run: |
           set -euo pipefail
           PRODUCTS="$RUNNER_TEMP/dd/Build/Products/Debug-iphonesimulator"
@@ -143,46 +148,58 @@ jobs:
           mkdir -p "$DIAG/video" "$DIAG/maestro"
           overall=0
 
-          IFS=',' read -ra LIST <<< "$DEVICES"
-          for RAW in "${LIST[@]}"; do
-            DEVICE=$(echo "$RAW" | sed 's/^ *//; s/ *$//')
+          run_device() {
+            local DEVICE=$1 SLUG UDID APPEARANCE OUT REC rc attempt
             SLUG=$(echo "$DEVICE" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '-' | tr -s '-' | sed 's/-$//')
-            UDID=$(xcrun simctl create "ci-$SLUG" "$DEVICE") || { echo "$SLUG create-failed" >> "$DIAG/results.txt"; overall=1; continue; }
+            UDID=$(xcrun simctl create "ci-$SLUG" "$DEVICE") || { echo "$SLUG create-failed" >> "$DIAG/results.txt"; return 1; }
             xcrun simctl boot "$UDID"
-            xcrun simctl bootstatus "$UDID" -b >>"$DIAG/bootstatus.log" 2>&1
+            xcrun simctl bootstatus "$UDID" -b >>"$DIAG/bootstatus-$SLUG.log" 2>&1
             xcrun simctl install "$UDID" "$APP"
-
-            for APPEARANCE in light dark; do
+            local failed=0
+            IFS=',' read -ra APPS <<< "$APPEARANCES"
+            for APPEARANCE in "${APPS[@]}"; do
+              APPEARANCE=$(echo "$APPEARANCE" | tr -d ' ')
               xcrun simctl ui "$UDID" appearance "$APPEARANCE"
               OUT="$DIAG/screenshots/$SLUG/$APPEARANCE"
               mkdir -p "$OUT" "$DIAG/maestro/$SLUG-$APPEARANCE"
-              xcrun simctl io "$UDID" recordVideo --codec h264 --force "$DIAG/video/$SLUG-$APPEARANCE.mp4" >>"$DIAG/record.log" 2>&1 &
+              xcrun simctl io "$UDID" recordVideo --codec h264 --force "$DIAG/video/$SLUG-$APPEARANCE.mp4" >>"$DIAG/record-$SLUG.log" 2>&1 &
               REC=$!
               sleep 2
-              set +e
               rc=1
               for attempt in 1 2; do
                 (cd "$OUT" && maestro --device "$UDID" test "$SRC/$FLOWS" \
                   --format junit --output "$DIAG/maestro/$SLUG-$APPEARANCE.xml" \
                   --debug-output "$DIAG/maestro/$SLUG-$APPEARANCE" \
-                  >>"$DIAG/maestro.log" 2>&1)
+                  >>"$DIAG/maestro-$SLUG-$APPEARANCE.log" 2>&1)
                 rc=$?
                 [[ $rc -eq 0 ]] && break
-                tail -c 4000 "$DIAG/maestro.log" | grep -q "IOSDriverTimeoutException" || break
+                tail -c 4000 "$DIAG/maestro-$SLUG-$APPEARANCE.log" | grep -q "IOSDriverTimeoutException" || break
                 echo "$SLUG $APPEARANCE attempt $attempt driver-timeout" >> "$DIAG/results.txt"
               done
-              set -e
               kill -INT "$REC" 2>/dev/null || true
               wait "$REC" 2>/dev/null || true
               echo "$SLUG $APPEARANCE rc=$rc" >> "$DIAG/results.txt"
-              [[ $rc -eq 0 ]] || overall=1
+              [[ $rc -eq 0 ]] || failed=1
             done
-
-            xcrun simctl spawn "$UDID" log show --last 1h --predicate "subsystem CONTAINS \"$BUNDLE_ID\" OR process == \"$SCHEME\"" \
+            xcrun simctl spawn "$UDID" log show --last 3h --predicate "subsystem CONTAINS \"$BUNDLE_ID\" OR process == \"$SCHEME\"" \
               >"$DIAG/app-$SLUG.log" 2>&1 || true
             xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
             xcrun simctl delete "$UDID" >/dev/null 2>&1 || true
+            return $failed
+          }
+
+          set +e
+          PIDS=()
+          IFS=',' read -ra LIST <<< "$DEVICES"
+          for RAW in "${LIST[@]}"; do
+            DEVICE=$(echo "$RAW" | sed 's/^ *//; s/ *$//')
+            run_device "$DEVICE" &
+            PIDS+=($!)
           done
+          for pid in "${PIDS[@]}"; do
+            wait "$pid" || overall=1
+          done
+          set -e
 
           cp -R "$HOME/Library/Logs/DiagnosticReports" "$DIAG/crashes" 2>/dev/null || true
           echo "rc=$overall" >> "$GITHUB_OUTPUT"
