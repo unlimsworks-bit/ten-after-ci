@@ -1,0 +1,227 @@
+# Public CI repo: .github/workflows/ios-maestro.yml
+#
+# Runs on a public GitHub macOS runner treated as a disposable Mac. The repo
+# holds this file and payload.tar.zst.age. Nothing else.
+#
+# Secrets / variables on the PUBLIC repo:
+#   secrets.SOURCE_AGE_IDENTITY   age private key that decrypts the payload. Used for nothing else.
+#   vars.OUTPUT_AGE_RECIPIENT     age public key of the developer. The runner encrypts diagnostics to it
+#                                 and can never read them back.
+#
+# Public log shows only: config check, tool versions, payload sha256, BUILD PASS/FAIL,
+# MAESTRO PASS/FAIL, byte count of the encrypted bundle. Everything verbose, every
+# screenshot and every screen recording goes to $RUNNER_TEMP/diagnostics and leaves
+# the runner only as ciphertext. scripts/ci-run.sh in the private repo decrypts it.
+
+name: ios-maestro
+
+on:
+  workflow_dispatch:
+    inputs:
+      devices:
+        description: Comma-separated simulator device types, each run in light and dark
+        type: string
+        default: iPhone SE (3rd generation),iPhone 16 Pro Max
+      flows:
+        description: Path to Maestro flows inside the payload
+        type: string
+        default: .maestro
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-maestro
+  cancel-in-progress: false
+
+env:
+  XCODE_VERSION: "16.4"          # present on macos-15; see actions/runner-images macos-15-Readme.md
+  MAESTRO_VERSION: "2.10.0"
+  MAESTRO_SHA256: "29b675e10cc12080e445e9bfb2e2b4e4dfb9c0f2e30d5884120d258b5e1cd991"
+  PROJECT: TenAfter.xcodeproj
+  SCHEME: TenAfter
+  MAESTRO_CLI_NO_ANALYTICS: "1"
+  HOMEBREW_NO_ANALYTICS: "1"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check configuration
+        env:
+          SOURCE_AGE_IDENTITY: ${{ secrets.SOURCE_AGE_IDENTITY }}
+          OUTPUT_AGE_RECIPIENT: ${{ vars.OUTPUT_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]] || { echo "refusing to run on $GITHUB_EVENT_NAME"; exit 1; }
+          [[ "$SOURCE_AGE_IDENTITY" == AGE-SECRET-KEY-1* ]] || { echo "SOURCE_AGE_IDENTITY secret is missing or not an age identity"; exit 1; }
+          [[ "$OUTPUT_AGE_RECIPIENT" == age1* ]] || { echo "OUTPUT_AGE_RECIPIENT variable is missing or not an age recipient"; exit 1; }
+          echo "CONFIG OK"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          brew install age zstd xcodegen >/dev/null
+          echo "age $(age --version)  $(zstd --version | head -1)  xcodegen $(xcodegen --version)"
+          curl -fsSL -o "$RUNNER_TEMP/maestro.zip" \
+            "https://github.com/mobile-dev-inc/maestro/releases/download/cli-${MAESTRO_VERSION}/maestro.zip"
+          echo "${MAESTRO_SHA256}  $RUNNER_TEMP/maestro.zip" | shasum -a 256 -c -
+          unzip -q "$RUNNER_TEMP/maestro.zip" -d "$RUNNER_TEMP/maestro-cli"
+          rm -f "$RUNNER_TEMP/maestro.zip"
+          echo "$RUNNER_TEMP/maestro-cli/maestro/bin" >> "$GITHUB_PATH"
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          xcodebuild -version | head -1
+
+      - name: Decrypt source
+        env:
+          SOURCE_AGE_IDENTITY: ${{ secrets.SOURCE_AGE_IDENTITY }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          SRC="$RUNNER_TEMP/src"
+          KEY="$RUNNER_TEMP/source.identity"
+          trap 'rm -f "$KEY"' EXIT
+          mkdir -p "$SRC"
+          printf '%s\n' "$SOURCE_AGE_IDENTITY" > "$KEY"
+          echo "payload sha256 $(shasum -a 256 payload.tar.zst.age | cut -c1-64)"
+          age -d -i "$KEY" payload.tar.zst.age | zstd -d -q | tar -x -C "$SRC"
+          rm -f "$KEY"
+          [[ -f "$SRC/SOURCE_REV" && -f "$SRC/project.yml" ]] || { echo "DECRYPT FAIL: payload is not a Ten After snapshot"; exit 1; }
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          echo "DIAG=$RUNNER_TEMP/diagnostics" >> "$GITHUB_ENV"
+          echo "DECRYPT OK"
+
+      - name: Build unsigned Simulator app
+        id: build
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIAG"
+          cp "$SRC/SOURCE_REV" "$DIAG/"
+          cd "$SRC"
+          set +e
+          bash scripts/check.sh >"$DIAG/check.log" 2>&1
+          rc=$?
+          [[ $rc -eq 0 ]] && xcodegen generate >"$DIAG/xcodegen.log" 2>&1
+          rc=$?
+          if [[ $rc -eq 0 ]]; then
+            xcodebuild build \
+              -project "$PROJECT" -scheme "$SCHEME" -configuration Debug \
+              -destination "generic/platform=iOS Simulator" \
+              -derivedDataPath "$RUNNER_TEMP/dd" \
+              -skipPackagePluginValidation -skipMacroValidation \
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+              >"$DIAG/xcodebuild.log" 2>&1
+            rc=$?
+          fi
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          printf 'BUILD %s\n' "$([[ $rc -eq 0 ]] && echo PASS || echo FAIL)"
+
+      - name: Simulator and Maestro
+        id: maestro
+        if: steps.build.outputs.rc == '0'
+        env:
+          DEVICES: ${{ inputs.devices }}
+          FLOWS: ${{ inputs.flows }}
+        run: |
+          set -euo pipefail
+          PRODUCTS="$RUNNER_TEMP/dd/Build/Products/Debug-iphonesimulator"
+          APP=$(find "$PRODUCTS" -maxdepth 1 -name '*.app' | head -1)
+          [[ -n "$APP" ]] || { echo "MAESTRO FAIL: no .app in build products"; echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0; }
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          echo "$BUNDLE_ID" > "$DIAG/bundle-id"
+          xcrun simctl list devicetypes >"$DIAG/devicetypes.txt" 2>&1 || true
+          mkdir -p "$DIAG/video" "$DIAG/maestro"
+          overall=0
+
+          IFS=',' read -ra LIST <<< "$DEVICES"
+          for RAW in "${LIST[@]}"; do
+            DEVICE=$(echo "$RAW" | sed 's/^ *//; s/ *$//')
+            SLUG=$(echo "$DEVICE" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '-' | tr -s '-' | sed 's/-$//')
+            UDID=$(xcrun simctl create "ci-$SLUG" "$DEVICE") || { echo "$SLUG create-failed" >> "$DIAG/results.txt"; overall=1; continue; }
+            xcrun simctl boot "$UDID"
+            xcrun simctl bootstatus "$UDID" -b >>"$DIAG/bootstatus.log" 2>&1
+            xcrun simctl install "$UDID" "$APP"
+
+            for APPEARANCE in light dark; do
+              xcrun simctl ui "$UDID" appearance "$APPEARANCE"
+              OUT="$DIAG/screenshots/$SLUG/$APPEARANCE"
+              mkdir -p "$OUT" "$DIAG/maestro/$SLUG-$APPEARANCE"
+              xcrun simctl io "$UDID" recordVideo --codec h264 --force "$DIAG/video/$SLUG-$APPEARANCE.mp4" >>"$DIAG/record.log" 2>&1 &
+              REC=$!
+              sleep 2
+              set +e
+              (cd "$OUT" && maestro --device "$UDID" test "$SRC/$FLOWS" \
+                --format junit --output "$DIAG/maestro/$SLUG-$APPEARANCE.xml" \
+                --debug-output "$DIAG/maestro/$SLUG-$APPEARANCE" \
+                >>"$DIAG/maestro.log" 2>&1)
+              rc=$?
+              set -e
+              kill -INT "$REC" 2>/dev/null || true
+              wait "$REC" 2>/dev/null || true
+              echo "$SLUG $APPEARANCE rc=$rc" >> "$DIAG/results.txt"
+              [[ $rc -eq 0 ]] || overall=1
+            done
+
+            xcrun simctl spawn "$UDID" log show --last 1h --predicate "subsystem CONTAINS \"$BUNDLE_ID\" OR process == \"$SCHEME\"" \
+              >"$DIAG/app-$SLUG.log" 2>&1 || true
+            xcrun simctl shutdown "$UDID" >/dev/null 2>&1 || true
+            xcrun simctl delete "$UDID" >/dev/null 2>&1 || true
+          done
+
+          cp -R "$HOME/Library/Logs/DiagnosticReports" "$DIAG/crashes" 2>/dev/null || true
+          echo "rc=$overall" >> "$GITHUB_OUTPUT"
+          printf 'MAESTRO %s\n' "$([[ $overall -eq 0 ]] && echo PASS || echo FAIL)"
+
+      - name: Encrypt diagnostics
+        id: encrypt
+        if: always()
+        env:
+          OUTPUT_AGE_RECIPIENT: ${{ vars.OUTPUT_AGE_RECIPIENT }}
+        run: |
+          set -euo pipefail
+          D="${DIAG:-$RUNNER_TEMP/diagnostics}"
+          mkdir -p "$D"
+          if find "$D" \( -name '*.app' -o -name '*.appex' -o -name '*.ipa' -o -name '*.identity' -o -name '*.xcarchive' \) | grep -q .; then
+            echo "ENCRYPT FAIL: forbidden files in diagnostics"
+            rm -rf "$D"
+            exit 1
+          fi
+          OUT="$RUNNER_TEMP/diagnostics.tar.zst.age"
+          tar -C "$D" -cf - . | zstd -T0 -q | age -r "$OUTPUT_AGE_RECIPIENT" -o "$OUT"
+          rm -rf "$D"
+          echo "DIAGNOSTICS ENCRYPTED $(stat -f %z "$OUT") bytes"
+
+      - name: Upload encrypted diagnostics only
+        if: always() && steps.encrypt.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: encrypted-ios-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/diagnostics.tar.zst.age
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Scrub runner
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/src" "$RUNNER_TEMP/dd" "$RUNNER_TEMP/diagnostics" \
+                 "$RUNNER_TEMP/source.identity" "$RUNNER_TEMP/maestro-cli" \
+                 "$HOME/Library/Developer/Xcode/DerivedData" 2>/dev/null || true
+
+      - name: Result
+        if: always()
+        env:
+          BUILD_RC: ${{ steps.build.outputs.rc }}
+          MAESTRO_RC: ${{ steps.maestro.outputs.rc }}
+        run: |
+          [[ "$BUILD_RC" == "0" && "$MAESTRO_RC" == "0" ]] && { echo "RESULT PASS"; exit 0; }
+          echo "RESULT FAIL (build=${BUILD_RC:-skipped} maestro=${MAESTRO_RC:-skipped})"
+          exit 1
