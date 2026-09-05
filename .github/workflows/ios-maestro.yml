@@ -154,7 +154,7 @@ jobs:
           overall=0
 
           run_device() {
-            local DEVICE=$1 DRIVER_PORT=$2 SLUG UDID APPEARANCE OUT REC rc attempt
+            local DEVICE=$1 SLUG UDID APPEARANCE OUT REC rc attempt
             SLUG=$(echo "$DEVICE" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n' '-' | tr -s '-' | sed 's/-$//')
             UDID=$(xcrun simctl create "ci-$SLUG" "$DEVICE") || { echo "$SLUG create-failed" >> "$DIAG/results.txt"; return 1; }
             xcrun simctl boot "$UDID"
@@ -175,7 +175,7 @@ jobs:
               fi
               rc=1
               for attempt in 1 2; do
-                (cd "$OUT" && maestro --device "$UDID" --driver-host-port "$DRIVER_PORT" test "$SRC/$FLOWS" \
+                (cd "$OUT" && maestro --device "$UDID" test "$SRC/$FLOWS" \
                   --format junit --output "$DIAG/maestro/$SLUG-$APPEARANCE.xml" \
                   --debug-output "$DIAG/maestro/$SLUG-$APPEARANCE" \
                   >>"$DIAG/maestro-$SLUG-$APPEARANCE.log" 2>&1)
@@ -199,17 +199,10 @@ jobs:
           }
 
           set +e
-          PIDS=()
-          DEVICE_SLOT=0
           IFS=',' read -ra LIST <<< "$DEVICES"
           for RAW in "${LIST[@]}"; do
             DEVICE=$(echo "$RAW" | sed 's/^ *//; s/ *$//')
-            run_device "$DEVICE" "$((22087 + DEVICE_SLOT))" &
-            PIDS+=($!)
-            DEVICE_SLOT=$((DEVICE_SLOT + 1))
-          done
-          for pid in "${PIDS[@]}"; do
-            wait "$pid" || overall=1
+            run_device "$DEVICE" || overall=1
           done
           set -e
 
