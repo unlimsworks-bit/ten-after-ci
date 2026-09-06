@@ -43,7 +43,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  XCODE_VERSION: "16.4"          # present on macos-15; see actions/runner-images macos-15-Readme.md
+  XCODE_VERSION: "26.3"          # present on macos-15; see actions/runner-images macos-15-Readme.md
   MAESTRO_VERSION: "2.10.0"
   MAESTRO_SHA256: "29b675e10cc12080e445e9bfb2e2b4e4dfb9c0f2e30d5884120d258b5e1cd991"
   PROJECT: TenAfter.xcodeproj
@@ -114,7 +114,9 @@ jobs:
           set -euo pipefail
           mkdir -p "$DIAG"
           cp "$SRC/SOURCE_REV" "$DIAG/"
+          cp "$SRC/SOURCE_FILES.sha256" "$DIAG/"
           cd "$SRC"
+          shasum -a 256 -c SOURCE_FILES.sha256 >"$DIAG/source-check.log" 2>&1
           set +e
           bash scripts/check.sh >"$DIAG/check.log" 2>&1
           rc=$?
