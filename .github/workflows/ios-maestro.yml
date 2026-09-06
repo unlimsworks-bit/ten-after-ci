@@ -81,7 +81,7 @@ jobs:
       - name: Install tools
         run: |
           set -euo pipefail
-          brew install age zstd xcodegen >/dev/null
+          brew install age zstd xcodegen ffmpeg >/dev/null
           echo "age $(age --version)  $(zstd --version | head -1)  xcodegen $(xcodegen --version)"
           curl -fsSL -o "$RUNNER_TEMP/maestro.zip" \
             "https://github.com/mobile-dev-inc/maestro/releases/download/cli-${MAESTRO_VERSION}/maestro.zip"
@@ -253,6 +253,18 @@ jobs:
             rm -rf "$D"
             exit 1
           fi
+          if command -v ffmpeg >/dev/null; then
+              for recording in "$D"/video/*.mp4; do
+                  [[ -f "$recording" && ! -f "$recording.encoded" ]] || continue
+                  encoded="${recording%.mp4}.review.mp4"
+                  if ffmpeg -v error -y -i "$recording" -vf fps=24 -c:v libx264 -crf 26 -pix_fmt yuv420p -an "$encoded" >>"$D/video-encoding.log" 2>&1; then
+                      mv "$encoded" "$recording"
+                      touch "$recording.encoded"
+                  else
+                      rm -f "$encoded"
+                  fi
+              done
+          fi
           OUT="$RUNNER_TEMP/diagnostics.tar.zst.age"
           tar -C "$D" -cf - . | zstd -T0 -q | age -r "$OUTPUT_AGE_RECIPIENT" -o "$OUT"
           rm -rf "$D"
@@ -271,7 +283,7 @@ jobs:
         if: always()
         run: |
           rm -rf "$RUNNER_TEMP/src" "$RUNNER_TEMP/dd" "$RUNNER_TEMP/diagnostics" \
-                 "$RUNNER_TEMP/source.identity" "$RUNNER_TEMP/maestro-cli" \
+                 "$RUNNER_TEMP/source.identity" "$RUNNER_TEMP/source.tar" "$RUNNER_TEMP/maestro-cli" \
                  "$HOME/Library/Developer/Xcode/DerivedData" 2>/dev/null || true
 
       - name: Result
