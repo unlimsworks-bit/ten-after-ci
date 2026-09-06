@@ -101,12 +101,21 @@ jobs:
           umask 077
           SRC="$RUNNER_TEMP/src"
           KEY="$RUNNER_TEMP/source.identity"
-          trap 'rm -f "$KEY"' EXIT
-          mkdir -p "$SRC"
+          ARCHIVE="$RUNNER_TEMP/source.tar"
+          DIAG="$RUNNER_TEMP/diagnostics"
+          trap 'rm -f "$KEY" "$ARCHIVE"' EXIT
+          mkdir -p "$SRC" "$DIAG"
           printf '%s\n' "$SOURCE_AGE_IDENTITY" > "$KEY"
           echo "payload sha256 $(shasum -a 256 payload.tar.zst.age | cut -c1-64)"
-          age -d -i "$KEY" payload.tar.zst.age | zstd -d -q | tar -x -C "$SRC"
-          rm -f "$KEY"
+          if ! { age -d -i "$KEY" payload.tar.zst.age | zstd -d -q > "$ARCHIVE"; } 2>"$DIAG/decrypt.log"; then
+            echo "DECRYPT FAIL"
+            exit 1
+          fi
+          if ! tar -xf "$ARCHIVE" -C "$SRC" >>"$DIAG/decrypt.log" 2>&1; then
+            echo "DECRYPT FAIL"
+            exit 1
+          fi
+          rm -f "$KEY" "$ARCHIVE"
           [[ -f "$SRC/SOURCE_REV" && -f "$SRC/project.yml" ]] || { echo "DECRYPT FAIL: payload is not a Ten After snapshot"; exit 1; }
           echo "SRC=$SRC" >> "$GITHUB_ENV"
           echo "DIAG=$RUNNER_TEMP/diagnostics" >> "$GITHUB_ENV"
