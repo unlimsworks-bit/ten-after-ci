@@ -34,6 +34,10 @@ on:
         description: Record each pass to MP4 (bundles grow by roughly 200 MB per 10 minutes of pass)
         type: boolean
         default: false
+      ui_tests:
+        description: Run native XCTest accessibility checks before each Maestro pass
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -123,7 +127,7 @@ jobs:
           [[ $rc -eq 0 ]] && xcodegen generate >"$DIAG/xcodegen.log" 2>&1
           rc=$?
           if [[ $rc -eq 0 ]]; then
-            xcodebuild build \
+            xcodebuild build-for-testing \
               -project "$PROJECT" -scheme "$SCHEME" -configuration Debug \
               -destination "generic/platform=iOS Simulator" \
               -derivedDataPath "$RUNNER_TEMP/dd" \
@@ -144,6 +148,7 @@ jobs:
           FLOWS: ${{ inputs.flows }}
           APPEARANCES: ${{ inputs.appearances }}
           RECORD: ${{ inputs.record }}
+          UI_TESTS: ${{ inputs.ui_tests }}
         run: |
           set -euo pipefail
           PRODUCTS="$RUNNER_TEMP/dd/Build/Products/Debug-iphonesimulator"
@@ -167,6 +172,19 @@ jobs:
             for APPEARANCE in "${APPS[@]}"; do
               APPEARANCE=$(echo "$APPEARANCE" | tr -d ' ')
               xcrun simctl ui "$UDID" appearance "$APPEARANCE"
+              if [[ "$UI_TESTS" == "true" ]]; then
+                mkdir -p "$DIAG/ui-tests"
+                (cd "$SRC" && xcodebuild test-without-building \
+                  -project "$PROJECT" -scheme "$SCHEME" \
+                  -destination "platform=iOS Simulator,id=$UDID" \
+                  -derivedDataPath "$RUNNER_TEMP/dd" \
+                  -resultBundlePath "$DIAG/ui-tests/$SLUG-$APPEARANCE.xcresult" \
+                  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+                  >"$DIAG/ui-tests/$SLUG-$APPEARANCE.log" 2>&1)
+                rc=$?
+                echo "$SLUG $APPEARANCE ui-tests rc=$rc" >> "$DIAG/results.txt"
+                [[ $rc -eq 0 ]] || failed=1
+              fi
               OUT="$DIAG/screenshots/$SLUG/$APPEARANCE"
               mkdir -p "$OUT" "$DIAG/maestro/$SLUG-$APPEARANCE"
               REC=""
